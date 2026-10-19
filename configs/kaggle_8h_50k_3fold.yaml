@@ -10,7 +10,8 @@
 # Budget arithmetic (passes = rows x folds; the refit adds one more copy):
 #   50,003 x 3 = 150,009 passes x 0.216 s = 9.0 h   <- does NOT fit 9 h
 #   50,003 x 2 = 100,006 passes            = 6.0 h
-#   so batch goes 8 -> 12 per card (global 72) to buy ~10-15% MFU back,
+#   so batch goes 8 -> 12 per card (24 in flight, 48 with accumulation)
+#   to buy ~10-15% MFU back,
 #   which puts 3 folds at ~7.8-8.2 h. The wall-clock guard (--deadline-hours
 #   8.8) trims the refit if the card turns out slower than that.
 #
@@ -69,7 +70,7 @@ features:
     mode: qlora
     model_id: Qwen/Qwen3-1.7B
     max_len: 384
-    batch_size: 12        # 12 x 2 cards x accum 2 = global 72
+    batch_size: 12        # 12 per card -> 24 in flight; x accum 2 = 48 effective
     grad_accum: 2
     layers: [2, 5, 8, 12, 16, 20, 24, 28]
     head_proj: 768
