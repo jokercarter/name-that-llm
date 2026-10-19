@@ -97,6 +97,8 @@ class QwenMember:
         triplet_batch: int = 3,
         centred_weight: float = 1.0,
         stage1_time_budget_hours: float = 0.0,
+        stage1_max_rows: int = 0,
+        stage1_class_weighted: bool = False,
         seed: int = 42,
         verbose: bool = True,
     ):
@@ -153,6 +155,11 @@ class QwenMember:
         self.triplet_batch = max(1, int(triplet_batch))
         self.centred_weight = float(centred_weight)
         self.stage1_time_budget_hours = float(stage1_time_budget_hours)
+        # stage1_max_rows: cap the pool so one epoch fits the wall-clock budget.
+        # 0 = use every pool row. The cap is stratified by label so rare classes
+        # keep their share (the public recipe relies on class weighting for this).
+        self.stage1_max_rows = max(0, int(stage1_max_rows))
+        self.stage1_class_weighted = bool(stage1_class_weighted)
         self.seed = int(seed)
         self.verbose = verbose
 
@@ -217,6 +224,19 @@ class QwenMember:
         self._log(f"loading {self.model_id} on {self.device} (4bit={self.load_in_4bit})")
         t0 = time.time()
 
+        # Two ranks each need a 4-bit copy of an 8B checkpoint, but the fp16
+        # shards they stream from disk peak well above the quantised size. Two
+        # simultaneous loads can exceed the ~29 GB a T4x2 kernel gets, so rank 1
+        # waits at a barrier until rank 0 has finished. Each rank calls the
+        # barrier exactly once, at different points.
+        from .. import dist_utils
+
+        dist_state = dist_utils.current()
+        serialised_load = self.distributed and dist_state.world > 1
+        if serialised_load and dist_state.rank > 0:
+            self.torch.cuda.empty_cache()
+            dist_utils.barrier()
+
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -265,6 +285,8 @@ class QwenMember:
 
         self.model = AutoModelForCausalLM.from_pretrained(self.model_id, **kwargs)
         self.model.eval()
+        if serialised_load and dist_state.rank == 0:
+            dist_utils.barrier()
         if self.device.type == "cuda":
             self.model.config.use_cache = False
         self._log(f"loaded in {time.time() - t0:.1f}s")
@@ -546,7 +568,7 @@ class QwenMember:
     # --------------------------------------------------------------- training
     def _train(self, texts, y, groups, *, epochs, lr, head_lr,
                deadline=None, stage: str = "stage2", world: int = 1,
-               rank: int = 0) -> None:
+               rank: int = 0, class_weights: Optional[np.ndarray] = None) -> None:
         """One training run: triplet batches, plain + centred cross-entropy.
 
         The loss is ``CE(plain) + CE(centred on triplet-centred features)``.
@@ -594,9 +616,16 @@ class QwenMember:
                 ).to(self.device)
                 plain, _centred, fused = self._qlora_logits(enc)
                 target = torch.as_tensor(y_all[my], device=self.device)
-                loss = torch.nn.functional.cross_entropy(
-                    plain, target, label_smoothing=self.label_smoothing
-                )
+                if class_weights is not None:
+                    w = torch.as_tensor(class_weights, device=self.device)
+                    loss = torch.nn.functional.cross_entropy(
+                        plain, target, weight=w,
+                        label_smoothing=self.label_smoothing
+                    )
+                else:
+                    loss = torch.nn.functional.cross_entropy(
+                        plain, target, label_smoothing=self.label_smoothing
+                    )
 
                 if _centred is not None and len(my_units) and len(my) % 3 == 0:
                     n_trip = len(my) // 3
@@ -629,21 +658,26 @@ class QwenMember:
                 optimiser.zero_grad(set_to_none=True)
                 step += 1
 
-                if self.log_every and step % self.log_every == 0:
-                    over = bool(deadline is not None and time.time() > deadline) if rank == 0 else False
-                    if world > 1:
-                        over = dist_utils.broadcast_flag(over, self.device)
-                    if over:
-                        self._log(f"{stage}: time budget reached at step {step}")
-                        stopped = True
-                        break
-                    if rank == 0:
-                        lr_now = scheduler.get_last_lr()[0]
-                        self._log(
-                            f"{stage} ep{epoch + 1} step {step}/{total_steps} "
-                            f"loss {float(loss):.4f} lr {lr_now:.2e} "
-                            f"({time.time() - t0:.0f}s)"
-                        )
+                # Deadline check runs every optimizer step, not every log_every:
+                # a long step must not be able to overrun the budget by more
+                # than one step. Every rank evaluates the flag in lockstep (the
+                # batch plan is deterministic) and joins the same broadcast, so
+                # no rank can exit the loop while another waits in all-reduce.
+                over = bool(deadline is not None and time.time() > deadline) if rank == 0 else False
+                if world > 1:
+                    over = dist_utils.broadcast_flag(over, self.device)
+                if over:
+                    self._log(f"{stage}: time budget reached at step {step}")
+                    stopped = True
+                    break
+
+                if self.log_every and step % self.log_every == 0 and rank == 0:
+                    lr_now = scheduler.get_last_lr()[0]
+                    self._log(
+                        f"{stage} ep{epoch + 1} step {step}/{total_steps} "
+                        f"loss {float(loss):.4f} lr {lr_now:.2e} "
+                        f"({time.time() - t0:.0f}s)"
+                    )
             if stopped:
                 break
 
@@ -663,6 +697,48 @@ class QwenMember:
         self._log(f"{stage}: {step} optimizer steps ({micro} micro-batches, "
                   f"{len(plan0)} triplet batches/epoch) in {time.time() - t0:.0f}s")
 
+    def _cap_stage1_rows(self, texts, y, groups):
+        """Stratified-by-label cap so one epoch fits the wall-clock budget.
+
+        The external pool is label-imbalanced (3.3x between the most and least
+        common model). A plain random cap would keep that ratio; a stratified
+        cap keeps every class represented at the same *rate*, which is what the
+        public recipe's class-weighted CE is trying to compensate for. Returns
+        the (possibly shortened) triplet of lists.
+        """
+        if self.stage1_max_rows <= 0 or len(texts) <= self.stage1_max_rows:
+            return texts, y, groups
+        rng = np.random.default_rng(self.seed)
+        y_arr = np.asarray(y)
+        keep = []
+        for label in np.unique(y_arr):
+            idx = np.flatnonzero(y_arr == label)
+            take = max(1, int(round(len(idx) * self.stage1_max_rows / len(texts))))
+            take = min(take, len(idx))
+            keep.append(rng.choice(idx, size=take, replace=False))
+        keep = np.sort(np.concatenate(keep))
+        self._log(f"stage1 cap: {len(texts)} -> {len(keep)} rows "
+                  f"(stratified by label, seed {self.seed})")
+        return ([texts[i] for i in keep], [y[i] for i in keep],
+                None if groups is None else [groups[i] for i in keep])
+
+    def _stage1_class_weights(self, y) -> Optional[np.ndarray]:
+        """Inverse-frequency weights, capped at 3x and mean-1 over present classes.
+
+        Absent classes get weight 0 (they cannot occur in stage 1 anyway).
+        """
+        if not self.stage1_class_weighted:
+            return None
+        index = {label: i for i, label in enumerate(LABELS)}
+        counts = np.bincount(np.asarray([index[v] for v in y], dtype=np.int64),
+                             minlength=len(LABELS)).astype(np.float64)
+        present = counts > 0
+        w = np.zeros(len(LABELS), dtype=np.float64)
+        w[present] = counts[present].sum() / (present.sum() * counts[present])
+        w = np.minimum(w, 3.0)
+        w[present] /= w[present].mean()
+        return w.astype(np.float32)
+
     def fit_stage1(self, texts: Sequence[str], y: Sequence[str],
                    groups: Optional[Sequence[int]] = None) -> "QwenMember":
         """Pretrain the adapter on the external pool only.
@@ -680,13 +756,15 @@ class QwenMember:
         world = state.world if self.distributed else 1
         rank = state.rank if self.distributed else 0
 
+        texts, y, groups = self._cap_stage1_rows(texts, y, groups)
         self._ensure_qlora()
         deadline = (time.time() + self.stage1_time_budget_hours * 3600.0
                     if self.stage1_time_budget_hours > 0 else None)
         self._log(f"stage1: {len(texts)} pool passages -> {self.stage1_epochs} epoch(s)")
         self._train(texts, y, np.asarray(groups if groups is not None else np.arange(len(texts))),
                     epochs=self.stage1_epochs, lr=self.stage1_lr, head_lr=self.head_lr,
-                    deadline=deadline, stage="stage1", world=world, rank=rank)
+                    deadline=deadline, stage="stage1", world=world, rank=rank,
+                    class_weights=self._stage1_class_weights(y))
 
         if world > 1:
             dist_utils.broadcast_tensors(

@@ -203,6 +203,8 @@ def build_qwen_member(cfg, device_info=None):
             triplet_batch=int(q.get("triplet_batch", 3)),
             centred_weight=float(q.get("centred_weight", 1.0)),
             stage1_time_budget_hours=float(q.get("stage1_time_budget_hours", 0.0)),
+            stage1_max_rows=int(q.get("stage1_max_rows", 0)),
+            stage1_class_weighted=bool(q.get("stage1_class_weighted", False)),
             seed=int(cfg.get("project.seed", 42)),
         )
     except Exception as exc:

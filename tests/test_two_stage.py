@@ -90,3 +90,48 @@ def test_mean_concat_head_shapes_and_first_token_is_ignored():
     hidden2[1][:, 0, :] = -3.0
     _, _, fused2 = head(hidden2, mask)
     assert torch.allclose(fused, fused2, atol=1e-5)
+
+
+# ------------------------------------------------------- stage-1 pool capping
+def test_stage1_cap_is_stratified_and_deterministic():
+    member = _member(stage1_max_rows=300, seed=7)
+    labels = np.array([0] * 600 + [1] * 300 + [2] * 100)
+    texts = [f"t{i}" for i in range(len(labels))]
+    groups = np.arange(len(labels))
+
+    t1, y1, g1 = member._cap_stage1_rows(texts, labels, groups)
+    t2, y2, g2 = member._cap_stage1_rows(texts, labels, groups)
+    assert len(t1) == len(y1) == len(g1) == 300
+    assert t1 == t2 and y1 == y2 and g1 == g2          # same seed -> same rows
+    counts = {int(v): int((np.asarray(y1) == v).sum()) for v in (0, 1, 2)}
+    # 300/1000 of each class, rounded: 180 / 90 / 30
+    assert counts == {0: 180, 1: 90, 2: 30}
+    # every kept row stays aligned across the three lists
+    for i, txt in enumerate(t1):
+        j = texts.index(txt)
+        assert y1[i] == labels[j] and g1[i] == groups[j]
+
+
+def test_stage1_cap_disabled_or_above_pool_is_a_noop():
+    member = _member(stage1_max_rows=0, seed=7)
+    labels = np.array([0, 1, 2])
+    texts = ["a", "b", "c"]
+    assert member._cap_stage1_rows(texts, labels, None) == (texts, labels, None)
+    member.stage1_max_rows = 10
+    assert member._cap_stage1_rows(texts, labels, None) == (texts, labels, None)
+
+
+def test_stage1_class_weights_are_capped_and_normalised():
+    from ntl_pact18.labels import LABELS
+    member = _member(stage1_class_weighted=True)
+    y = [LABELS[0]] * 100 + [LABELS[1]] * 50 + [LABELS[2]] * 10
+    w = member._stage1_class_weights(y)
+    assert w is not None and len(w) == 18
+    # inverse frequency 160/(3*n): 0.533 / 1.067 / 5.333 -> cap 3.0 ->
+    # mean-1 over the three present classes
+    expect = np.minimum(np.array([0.5333, 1.0667, 5.3333]), 3.0)
+    expect = expect / expect.mean()
+    assert np.allclose(w[:3], expect, atol=1e-4)
+    assert np.all(w[3:] == 0.0)                     # absent classes get 0
+    assert abs(np.mean(w[:3]) - 1.0) < 1e-5
+    assert _member(stage1_class_weighted=False)._stage1_class_weights(y) is None

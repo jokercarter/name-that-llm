@@ -8,8 +8,13 @@ from ntl_pact18.pipeline import PACT18Pipeline
 
 
 def _tiny_config():
+    # The qwen member loads an 8B trunk; this test exercises the pipeline
+    # orchestration, so the member is disabled (it has its own tests in
+    # test_two_stage.py / test_qlora_head.py / test_qlora_split.py, and the
+    # Kaggle smoke kernel runs it on real hardware).
     return load_config(
         overrides=[
+            "features.qwen.enabled=false",
             "project.seed=3",
             "data.n_folds=2",
             "features.stylegram.char.max_features=3000",

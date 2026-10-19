@@ -3,8 +3,8 @@
 # What changed versus kaggle_8h_50k_3fold.yaml
 # ---------------------------------------------
 # 1. The pool is no longer mixed into the training file. Stage 1 trains on the
-#    external passages only (up to 2 epochs), stage 2 fine-tunes on the 2,699
-#    host passages only (2 epochs). Mixing them back is reported to hurt.
+#    external passages only (1 epoch, the public recipe), stage 2 fine-tunes on
+#    the 2,699 host passages only (2 epochs). Mixing them back hurts.
 # 2. The trunk is truncated to the first 24 of 36 blocks. Style lives in the
 #    early/middle layers; the last blocks encode topic and the test prompts are
 #    unseen, so they cost ~33% of the compute and buy nothing.
@@ -12,10 +12,12 @@
 #    two linear heads: plain and centred. The centred head is trained on
 #    triplet-centred features (three models answering the same prompt).
 #
-# Budget (measured 0.216 s/sample-pass at 36 blocks, so ~0.144 at 24):
-#   stage 1: up to 25k triplet rows x 2 epochs ~ 2.0 h
-#   stage 2: 3 folds x ~0.15 h + refit ~0.25 h ~ 0.7 h
-#   classical ~0.5 h, assemble ~0.2 h  ->  total ~3.5 h
+# Budget (measured 0.216 s/sample-pass on the 1.7B trunk at 28 layers; the 8B
+# trunk keeps 24/36 layers and is ~4.0x wider per layer, so expect ~0.6-0.7
+# s/sample on 2x T4 - the smoke kernel measures the exact number):
+#   stage 1: <=13k triplet rows x 1 epoch ~ 2.4 h (cap + budget agree)
+#   stage 2: 3 folds x ~1.0 h + refit ~1.0 h ~ 4.0 h
+#   classical ~1.0 h, assemble ~0.2 h  ->  total ~7.6 h
 # The per-fit caps below only bind if the card is slower than measured.
 
 project:
@@ -76,7 +78,7 @@ features:
     lora_alpha: 32
     lora_dropout: 0.05
     target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
-    stage1_epochs: 2
+    stage1_epochs: 1
     stage1_lr: 0.0001
     stage2_epochs: 2
     stage2_lr: 0.00005
@@ -97,7 +99,9 @@ features:
     val_fraction: 0.0
     log_every: 50
     stage1_time_budget_hours: 2.4
-    time_budget_hours: 0.8
+    stage1_max_rows: 13000          # stratified by label; 0 = every pool row
+    stage1_class_weighted: true     # inverse-frequency CE, capped at 3x
+    time_budget_hours: 1.0
 
 calibration:
   temperature: true
