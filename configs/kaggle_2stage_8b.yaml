@@ -98,8 +98,12 @@ features:
     reset_before_fit: false
     val_fraction: 0.0
     log_every: 50
-    stage1_time_budget_hours: 2.4
-    stage1_max_rows: 13000          # stratified by label; 0 = every pool row
+    stage1_time_budget_hours: 3.0
+    # Smoke-measured throughput on 2xT4: ~0.89 s/sample/rank (max_len=384,
+    # 9 samples per 8 s micro-batch). ~35k rows -> ~2.4h for 1 epoch, matching
+    # the public recipe's pool-pretrain volume. 3.0h is a safety valve; the
+    # deadline check stops mid-epoch gracefully if the real SPP is higher.
+    stage1_max_rows: 35000          # stratified by label; 0 = every pool row
     stage1_class_weighted: true     # inverse-frequency CE, capped at 3x
     time_budget_hours: 1.0
 
