@@ -303,6 +303,19 @@ def cmd_assemble(args) -> int:
         print(f"[assemble] stacking layer fitted on {int(mask.sum())} competition rows "
               f"out of {len(df)}", flush=True)
 
+    # per-member OOF on the competition rows: without this the only visible
+    # number is the blend, and a degraded member is indistinguishable from a
+    # degraded blend (this is what made the 0.3867 run hard to attribute)
+    from ntl_pact18.evaluate import balanced_accuracy
+    from ntl_pact18.labels import LABEL_TO_INDEX
+
+    y_idx = np.asarray([LABEL_TO_INDEX[v] for v in df["model"]], dtype=int)
+    rows = mask if mask is not None else np.ones(len(df), dtype=bool)
+    print("[assemble] per-member OOF balanced accuracy on the eval rows:", flush=True)
+    for name, arr in oof.items():
+        ba = balanced_accuracy(y_idx[rows], arr[rows].argmax(axis=1))
+        print(f"  {name:16s} {ba:.4f}", flush=True)
+
     pipe = PACT18Pipeline(cfg).fit(
         df, members=members, oof=oof, refit=False, eval_mask=mask
     )

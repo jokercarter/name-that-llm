@@ -214,7 +214,14 @@ python scripts/train_parallel.py --stage all \
 - **原因**：赛题要 `submission.parquet`，两列 `id/model`，且 id 必须覆盖测试集。
 - **修复**：`train_parallel.py --stage assemble` 已直接写 parquet，并断言列名、行数、id 唯一、标签 ⊆ 18 类。
 
-### 5.10 joblib 跨版本
+### 5.10 训练成功但 notebook 状态 ERROR：`No module named 'ntl_pact18'`（本次实测）
+
+- **现象**：日志末尾 `[exit] 0 in 6.97 h`、`submission -> /kaggle/working/submission.parquet`，但 notebook 断言 `PapermillExecutionError`、版本状态 ERROR。
+- **原因**：最后一个「校验 submission」的 cell 在 **kernel 进程**里执行 `from ntl_pact18.labels import LABELS`。只有 `run.py` 和各个子进程会自己把 `src/` 加进 `sys.path`；`%cd` 只改工作目录，不改 `sys.path`。
+- **后果**：产物是完整的，但 ERROR 版本不能被 Submit，也不会保留完整输出快照（本次只留下 0 字节的 `classical.joblib`）。
+- **修复**：校验 cell 开头加 `sys.path.insert(0, f'{WORK}/src')`；同时在训练 cell 末尾加 `assert rc == 0`，让真正的训练失败在正确的位置报错，而不是被后面的 ImportError 掩盖。
+
+### 5.11 joblib 跨版本
 
 - **原因**：本地 sklearn 1.9.1 / torch 2.14.1 存的模型，Kaggle 是 sklearn 1.6 / torch 2.11。
 - **修复**：**在 notebook 内重训**（本文流程就是重训），或固定镜像版本；不要上传本地 `.joblib`。
