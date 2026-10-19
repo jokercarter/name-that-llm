@@ -73,6 +73,62 @@ class LayerFusionHead(nn.Module):
         return self.out(self.drop(fused)), fused
 
 
+class MeanConcatHead(nn.Module):
+    """Per-layer LayerNorm + masked mean pool, concatenated, two linear heads.
+
+    This is the head used by the current public two-stage LoRA recipe. It is
+    cheaper than :class:`LayerFusionHead` (no per-layer projection or attention
+    scorer) and, more importantly, it exposes **two** heads over the same pooled
+    features: ``plain`` and ``centred``. The centred head is trained on
+    triplet-centred features, i.e. on the residual after subtracting the mean of
+    three passages that answer the same prompt, which is what teaches the
+    representation to ignore the topic.
+
+    The first token is dropped from the mean: in decoder-only models it acts as
+    an attention sink and its state is dominated by position, not style.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        n_layers: int,
+        n_classes: int = 18,
+        dropout: float = 0.1,
+        drop_first_token: bool = True,
+    ):
+        super().__init__()
+        self.n_layers = int(n_layers)
+        self.drop_first_token = bool(drop_first_token)
+        self.norms = nn.ModuleList(
+            [nn.LayerNorm(hidden_size) for _ in range(n_layers)]
+        )
+        self.drop = nn.Dropout(dropout)
+        width = hidden_size * n_layers
+        self.plain = nn.Linear(width, n_classes)
+        self.centered = nn.Linear(width, n_classes)
+
+    def forward(
+        self,
+        hidden_states: Sequence[torch.Tensor],
+        attention_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(hidden_states) != self.n_layers:
+            raise ValueError(
+                f"head expects {self.n_layers} layers, got {len(hidden_states)}"
+            )
+        mask = attention_mask.to(torch.float32).unsqueeze(-1)
+        if self.drop_first_token and mask.size(1) > 1:
+            mask = mask.clone()
+            mask[:, 0, :] = 0.0
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        pooled = [
+            norm((hidden.float() * mask).sum(dim=1) / denom)
+            for hidden, norm in zip(hidden_states, self.norms)
+        ]
+        fused = self.drop(torch.cat(pooled, dim=-1))
+        return self.plain(fused), self.centered(fused), fused
+
+
 def supcon_loss(
     features: torch.Tensor,
     labels: torch.Tensor,

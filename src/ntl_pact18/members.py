@@ -158,6 +158,9 @@ def build_qwen_member(cfg, device_info=None):
         return QwenMember(
             device_info,
             mode=str(q.get("mode", "probe")),
+            # ``mode: two_stage`` implies the two-stage trainer unless the
+            # explicit flag overrides it
+            two_stage=bool(q.get("two_stage", str(q.get("mode", "")) == "two_stage")),
             model_id=str(q.get("model_id", "Qwen/Qwen3-8B-Base")),
             max_len=int(q.get("max_len", 384)),
             batch_size=int(q.get("batch_size", 8)),
@@ -189,6 +192,17 @@ def build_qwen_member(cfg, device_info=None):
             compute_dtype=str(q.get("compute_dtype", "auto")),
             head_proj=int(q.get("head_proj", 512)),
             head_dropout=float(q.get("head_dropout", 0.1)),
+            truncate_layers=int(q.get("truncate_layers", 0)),
+            pool_mode=str(q.get("pool_mode", "attention")),
+            stage1_epochs=int(q.get("stage1_epochs", 1)),
+            stage1_lr=float(q.get("stage1_lr", 1e-4)),
+            stage2_epochs=int(q.get("stage2_epochs", 2)),
+            stage2_lr=float(q.get("stage2_lr", 5e-5)),
+            head_lr=float(q.get("head_lr", 1e-3)),
+            stage2_head_lr=float(q.get("stage2_head_lr", 5e-4)),
+            triplet_batch=int(q.get("triplet_batch", 3)),
+            centred_weight=float(q.get("centred_weight", 1.0)),
+            stage1_time_budget_hours=float(q.get("stage1_time_budget_hours", 0.0)),
             seed=int(cfg.get("project.seed", 42)),
         )
     except Exception as exc:

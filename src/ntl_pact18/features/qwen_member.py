@@ -85,6 +85,18 @@ class QwenMember:
         compute_dtype: str = "auto",
         head_proj: int = 512,
         head_dropout: float = 0.1,
+        truncate_layers: int = 0,
+        pool_mode: str = "attention",
+        two_stage: bool = False,
+        stage1_epochs: int = 1,
+        stage1_lr: float = 1e-4,
+        stage2_epochs: int = 2,
+        stage2_lr: float = 5e-5,
+        head_lr: float = 1e-3,
+        stage2_head_lr: float = 5e-4,
+        triplet_batch: int = 3,
+        centred_weight: float = 1.0,
+        stage1_time_budget_hours: float = 0.0,
         seed: int = 42,
         verbose: bool = True,
     ):
@@ -125,6 +137,22 @@ class QwenMember:
         self.compute_dtype = str(compute_dtype).lower()
         self.head_proj = int(head_proj)
         self.head_dropout = float(head_dropout)
+        # --- truncated trunk + two-stage training (public 0.59x recipe) ---
+        # truncate_layers: keep only the first N decoder blocks. Style lives in
+        # the early/middle layers; the last blocks mostly encode topic, and test
+        # prompts are unseen, so they are pure compute.
+        self.truncate_layers = int(truncate_layers)
+        self.pool_mode = str(pool_mode).lower()
+        self.two_stage = bool(two_stage)
+        self.stage1_epochs = max(1, int(stage1_epochs))
+        self.stage1_lr = float(stage1_lr)
+        self.stage2_epochs = max(1, int(stage2_epochs))
+        self.stage2_lr = float(stage2_lr)
+        self.head_lr = float(head_lr)
+        self.stage2_head_lr = float(stage2_head_lr)
+        self.triplet_batch = max(1, int(triplet_batch))
+        self.centred_weight = float(centred_weight)
+        self.stage1_time_budget_hours = float(stage1_time_budget_hours)
         self.seed = int(seed)
         self.verbose = verbose
 
@@ -145,6 +173,11 @@ class QwenMember:
         self._lm_head = None
         self._qlora_state = None
         self._head_state = None
+        # stage-1 adapter (pool-only pretraining) kept on host memory so every
+        # fold's stage 2 starts from the same weights instead of from the
+        # previous fold's fine-tune
+        self._stage1_state = None
+        self._stage1_done = False
         # Free the backbone after fit so the next GPU member (XGBoost, ...) gets
         # the whole 8 GB; predict() reloads lazily and reuses the cache.
         self.release_after_fit = True
@@ -189,6 +222,25 @@ class QwenMember:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         kwargs: Dict = {}
+        if self.truncate_layers > 0:
+            # Keep only the first N decoder blocks. Building the model from a
+            # modified config means the upper blocks are never materialised --
+            # 8B drops from 36 to 24 blocks, i.e. ~33% less compute per token
+            # and ~1.7 GB less 4-bit weight -- instead of merely skipping them
+            # at run time.
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(self.model_id)
+            full = int(getattr(config, "num_hidden_layers", 0) or 0)
+            if full and self.truncate_layers < full:
+                config.num_hidden_layers = self.truncate_layers
+                if getattr(config, "layer_types", None) is not None:
+                    config.layer_types = config.layer_types[: self.truncate_layers]
+                kwargs["config"] = config
+                self._log(
+                    f"truncated trunk: {full} -> {self.truncate_layers} blocks "
+                    f"(upper blocks never materialised)"
+                )
         if self.load_in_4bit and self.device.type == "cuda":
             try:
                 from transformers import BitsAndBytesConfig
@@ -219,7 +271,7 @@ class QwenMember:
 
         # rebuild the QLoRA adapter + fusion head from the numpy state that
         # __getstate__ stored (the 4-bit base is re-loaded, never serialised)
-        if self.mode == "qlora" and not self._peft_wrapped and (
+        if self.mode != "probe" and not self._peft_wrapped and (
             getattr(self, "_qlora_state", None) or getattr(self, "_head_state", None)
         ):
             self._build_qlora()
@@ -351,10 +403,18 @@ class QwenMember:
         )
         self.model = get_peft_model(self.model, cfg)
         hidden = self.model.config.hidden_size
-        self.head = LayerFusionHead(
-            hidden, len(self.layers), len(LABELS),
-            proj=self.head_proj, dropout=self.head_dropout,
-        ).to(self.device)
+        if self.pool_mode == "mean_concat":
+            from .qlora_head import MeanConcatHead
+
+            self.head = MeanConcatHead(
+                hidden, len(self.layers), len(LABELS),
+                dropout=self.head_dropout,
+            ).to(self.device)
+        else:
+            self.head = LayerFusionHead(
+                hidden, len(self.layers), len(LABELS),
+                proj=self.head_proj, dropout=self.head_dropout,
+            ).to(self.device)
         self._n_features = hidden
         self._peft_wrapped = True
         if self.skip_lm_head:
@@ -399,18 +459,55 @@ class QwenMember:
         return int(n)
 
     def _qlora_logits(self, enc):
+        """Return ``(plain_logits, centred_logits_or_None, fused_features)``."""
         out = self.model(**enc, output_hidden_states=True)
         hidden = [out.hidden_states[i] for i in self.layers]
-        return self.head(hidden, enc["attention_mask"])
+        res = self.head(hidden, enc["attention_mask"])
+        if len(res) == 3:
+            return res
+        logits, fused = res
+        return logits, None, fused
+
+    # ------------------------------------------------------------ triplet plan
+    def _triplet_units(self, groups, y_idx, rng):
+        """Groups -> lists of three rows with three *distinct* labels.
+
+        One passage per label, so a triplet always spans three different models
+        answering the same prompt. That is what makes the centred head learn
+        "same question, different author" instead of "same topic".
+        """
+        units = []
+        for g in np.unique(groups):
+            idx = np.flatnonzero(groups == g)
+            first = {}
+            for i in idx:
+                first.setdefault(int(y_idx[i]), int(i))
+            rows = list(first.values())
+            if len(rows) < 3:
+                continue
+            rng.shuffle(rows)
+            for s in range(0, len(rows) - 2, 3):
+                units.append(rows[s:s + 3])
+        return units
+
+    def _triplet_batches(self, groups, y_idx, world, seed, epoch):
+        """Deterministic plan; every rank derives the same batches."""
+        rng = np.random.default_rng(seed + 1000 * epoch)
+        units = self._triplet_units(groups, y_idx, rng)
+        if not units:
+            return []
+        order = rng.permutation(len(units))
+        units = [units[i] for i in order]
+        span = self.triplet_batch * max(1, world)
+        n = len(units) // span * span
+        return [units[s:s + span] for s in range(0, n, span)]
 
     def _make_batches(self, indices, lengths, global_batch: int, seed: int):
-        """Deterministic batch plan, identical on every rank.
+        """Length-bucketed batch plan (kept for the single-stage QLoRA path).
 
-        Length bucketing is worth ~20-30% on this corpus: the median passage is
-        ~130 tokens but the tail reaches ~360, so a random batch pads every row
-        to its longest member. Sorting into length pools makes batches
-        homogeneous, and shuffling the *batch order* (not the rows inside a
-        pool) avoids turning the epoch into a length curriculum.
+        The two-stage trainer uses :meth:`_triplet_batches` instead, but the
+        bucketing helper is still exercised by the unit tests and is the right
+        tool when a plain (non-triplet) epoch is needed.
         """
         rng = np.random.default_rng(seed)
         idx = np.asarray(indices)
@@ -436,52 +533,39 @@ class QwenMember:
         order = rng.permutation(len(batches))
         return [batches[i] for i in order]
 
-    def _fit_qlora(self, texts: Sequence[str], y: Sequence[str],
-                   groups: Optional[Sequence[int]] = None) -> "QwenMember":
-        torch = self.torch or import_torch()
-        self.torch = torch
-        from .qlora_head import supcon_loss
+    def _make_optimiser(self, lr: float, head_lr: float):
+        torch = self.torch
+        lora_params = [p for p in self.model.parameters() if p.requires_grad]
+        head_params = [p for p in self.head.parameters()]
+        groups = [
+            {"params": lora_params, "lr": lr},
+            {"params": head_params, "lr": head_lr},
+        ]
+        return torch.optim.AdamW(groups, weight_decay=self.weight_decay)
 
+    # --------------------------------------------------------------- training
+    def _train(self, texts, y, groups, *, epochs, lr, head_lr,
+               deadline=None, stage: str = "stage2", world: int = 1,
+               rank: int = 0) -> None:
+        """One training run: triplet batches, plain + centred cross-entropy.
+
+        The loss is ``CE(plain) + CE(centred on triplet-centred features)``.
+        The second term is the one that makes the representation prompt
+        invariant: for three passages about the same volcano, only the residual
+        after subtracting their mean still carries the author.
+        """
+        torch = self.torch
         from .. import dist_utils
 
-        state = dist_utils.current()
-        world = state.world if self.distributed else 1
-        rank = state.rank if self.distributed else 0
-
-        # Every fold starts from a fresh adapter. Reusing the previous fold's
-        # weights would leak that fold's rows into this fold's OOF prediction.
-        if self._fit_count > 0 and self.reset_before_fit:
-            self.release(capture=False)   # this fold's weights are discarded
-            self.head = None
-            self._qlora_state = None
-            self._head_state = None
-
-        self._ensure_qlora()
         head = self.head
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        params += list(head.parameters())
-        optimiser = torch.optim.AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
+        optimiser = self._make_optimiser(lr, head_lr)
         index = {label: i for i, label in enumerate(LABELS)}
         y_all = np.asarray([index[v] for v in y], dtype=np.int64)
 
-        tr_idx, va_idx = split_by_group(groups, len(texts), self.val_fraction, self.seed)
-        if len(va_idx) > 192:  # keep the inner probe cheap on T4
-            va_idx = np.random.default_rng(self.seed).choice(va_idx, 192, replace=False)
-
-        lengths = np.asarray([len(t) for t in texts])
-        per_rank = max(1, min(self.batch_size, max(1, len(tr_idx) // max(1, world))))
-        global_batch = per_rank * max(1, world)
-        batches_per_epoch = max(1, len(tr_idx) // global_batch)
-        steps_per_epoch = max(1, batches_per_epoch // self.grad_accum)
-        total_steps = steps_per_epoch * self.epochs
+        plan0 = self._triplet_batches(groups, y_all, world, self.seed, 0)
+        steps_per_epoch = max(1, len(plan0) // self.grad_accum)
+        total_steps = steps_per_epoch * epochs
         warmup = max(1, int(total_steps * self.warmup_ratio))
-
-        self._log(
-            f"qlora split: train={len(tr_idx)} val={len(va_idx)} "
-            f"(groups held out={self.val_fraction:.0%}) | "
-            f"world={world} per_rank_batch={per_rank} global_batch={global_batch} "
-            f"accum={self.grad_accum} steps/epoch={steps_per_epoch}"
-        )
 
         def lr_lambda(step: int) -> float:
             if step < warmup:
@@ -490,145 +574,213 @@ class QwenMember:
             return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lr_lambda)
-        deadline = (time.time() + self.time_budget_hours * 3600.0
-                    if self.time_budget_hours > 0 else None)
-
-        def balanced_accuracy() -> float:
-            if not len(va_idx):
-                return float("nan")
-            self.model.eval()
-            head.eval()
-            preds = []
-            with torch.inference_mode():
-                for s0 in range(0, len(va_idx), max(1, self.batch_size * 2)):
-                    chunk = va_idx[s0:s0 + max(1, self.batch_size * 2)]
-                    enc = self.tokenizer(
-                        [texts[i] for i in chunk], padding=True, truncation=True,
-                        max_length=self.max_len, return_tensors="pt",
-                    ).to(self.device)
-                    logits, _ = self._qlora_logits(enc)
-                    preds.append(logits.argmax(dim=1).cpu().numpy())
-            self.model.train()
-            head.train()
-            pred = np.concatenate(preds)
-            truth = y_all[va_idx]
-            recalls = [float((pred[truth == c] == c).mean())
-                       for c in np.unique(truth) if (truth == c).any()]
-            return float(np.mean(recalls)) if recalls else float("nan")
-
-        best_ba, best_step, bad_evals = -1.0, 0, 0
-        best_lora = best_head = None
         self.model.train()
         head.train()
+
         step = micro = 0
         t0 = time.time()
         stopped = False
-
-        for epoch in range(self.epochs):
-            plan = self._make_batches(tr_idx, lengths, global_batch, self.seed + epoch)
+        for epoch in range(epochs):
+            plan = self._triplet_batches(groups, y_all, world, self.seed, epoch)
             if not plan:
+                self._log(f"{stage}: no triplet batch (groups too small)")
                 break
             for batch in plan:
-                my = batch[rank * per_rank:(rank + 1) * per_rank]
+                my_units = batch[rank * self.triplet_batch:(rank + 1) * self.triplet_batch]
+                my = [i for unit in my_units for i in unit]
                 enc = self.tokenizer(
                     [texts[i] for i in my], padding=True, truncation=True,
                     max_length=self.max_len, return_tensors="pt",
                 ).to(self.device)
-                logits, fused = self._qlora_logits(enc)
+                plain, _centred, fused = self._qlora_logits(enc)
                 target = torch.as_tensor(y_all[my], device=self.device)
                 loss = torch.nn.functional.cross_entropy(
-                    logits, target, label_smoothing=self.label_smoothing
+                    plain, target, label_smoothing=self.label_smoothing
                 )
+
+                if _centred is not None and len(my_units) and len(my) % 3 == 0:
+                    n_trip = len(my) // 3
+                    resid = fused.view(n_trip, 3, -1)
+                    resid = resid - resid.mean(dim=1, keepdim=True)
+                    logits_c = head.centered(resid.reshape(len(my), -1))
+                    loss = loss + self.centred_weight * torch.nn.functional.cross_entropy(
+                        logits_c, target, label_smoothing=self.label_smoothing
+                    )
+
                 if self.supcon_weight > 0 and len(my) > 1:
+                    from .qlora_head import supcon_loss
+
                     loss = loss + self.supcon_weight * supcon_loss(fused, target)
+
                 (loss / self.grad_accum).backward()
                 micro += 1
                 if micro % self.grad_accum:
                     continue
 
                 if world > 1:
-                    dist_utils.all_reduce_grads(params, world)
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                    dist_utils.all_reduce_grads(
+                        [p for g in optimiser.param_groups for p in g["params"]], world
+                    )
+                torch.nn.utils.clip_grad_norm_(
+                    [p for g in optimiser.param_groups for p in g["params"]], 1.0
+                )
                 optimiser.step()
                 scheduler.step()
                 optimiser.zero_grad(set_to_none=True)
                 step += 1
 
-                if step % self.eval_every == 0 and len(va_idx):
-                    stop_now = False
-                    if rank == 0:
-                        ba = balanced_accuracy()
-                        improved = ba > best_ba + 0.002
-                        if improved:
-                            best_ba, best_step, bad_evals = ba, step, 0
-                            best_lora = {k: v.detach().clone()
-                                         for k, v in self.model.named_parameters()
-                                         if v.requires_grad}
-                            best_head = {k: v.detach().clone()
-                                         for k, v in head.state_dict().items()}
-                        else:
-                            bad_evals += 1
-                        self._log(f"step {step}: inner val BA {ba:.4f} "
-                                  f"(best {best_ba:.4f} @ {best_step})")
-                        stop_now = bad_evals >= self.early_stop_patience
-                        if stop_now:
-                            self._log(f"early stop at step {step}")
-                    if world > 1:
-                        stop_now = dist_utils.broadcast_flag(stop_now, self.device)
-                    if stop_now:
-                        stopped = True
-                        break
-
-                if step % self.log_every == 0:
-                    # rank 0 owns the clock; a local deadline on each rank could
-                    # fire on one rank only and hang the next collective
+                if self.log_every and step % self.log_every == 0:
                     over = bool(deadline is not None and time.time() > deadline) if rank == 0 else False
                     if world > 1:
                         over = dist_utils.broadcast_flag(over, self.device)
                     if over:
-                        self._log(f"time budget reached at step {step}")
+                        self._log(f"{stage}: time budget reached at step {step}")
                         stopped = True
                         break
                     if rank == 0:
                         lr_now = scheduler.get_last_lr()[0]
-                        self._log(f"epoch {epoch + 1} step {step}/{total_steps} "
-                                  f"loss {float(loss):.4f} lr {lr_now:.2e} "
-                                  f"({time.time() - t0:.0f}s)")
+                        self._log(
+                            f"{stage} ep{epoch + 1} step {step}/{total_steps} "
+                            f"loss {float(loss):.4f} lr {lr_now:.2e} "
+                            f"({time.time() - t0:.0f}s)"
+                        )
             if stopped:
                 break
 
         if micro % self.grad_accum:
             if world > 1:
-                dist_utils.all_reduce_grads(params, world)
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
+                dist_utils.all_reduce_grads(
+                    [p for g in optimiser.param_groups for p in g["params"]], world
+                )
+            torch.nn.utils.clip_grad_norm_(
+                [p for g in optimiser.param_groups for p in g["params"]], 1.0
+            )
             optimiser.step()
             step += 1
 
-        if rank == 0 and best_lora is not None:
-            with torch.no_grad():
-                own = dict(self.model.named_parameters())
-                for name, tensor in best_lora.items():
-                    own[name].copy_(tensor)
-                head.load_state_dict(best_head)
-            self._log(f"restored best checkpoint (step {best_step}, inner BA {best_ba:.4f})")
+        self.model.eval()
+        head.eval()
+        self._log(f"{stage}: {step} optimizer steps ({micro} micro-batches, "
+                  f"{len(plan0)} triplet batches/epoch) in {time.time() - t0:.0f}s")
+
+    def fit_stage1(self, texts: Sequence[str], y: Sequence[str],
+                   groups: Optional[Sequence[int]] = None) -> "QwenMember":
+        """Pretrain the adapter on the external pool only.
+
+        No host passage is seen here, so this stage cannot leak a label into any
+        OOF fold; each fold then starts stage 2 from this same snapshot.
+        """
+        if not self.two_stage:
+            return self
+        torch = self.torch or import_torch()
+        self.torch = torch
+        from .. import dist_utils
+
+        state = dist_utils.current()
+        world = state.world if self.distributed else 1
+        rank = state.rank if self.distributed else 0
+
+        self._ensure_qlora()
+        deadline = (time.time() + self.stage1_time_budget_hours * 3600.0
+                    if self.stage1_time_budget_hours > 0 else None)
+        self._log(f"stage1: {len(texts)} pool passages -> {self.stage1_epochs} epoch(s)")
+        self._train(texts, y, np.asarray(groups if groups is not None else np.arange(len(texts))),
+                    epochs=self.stage1_epochs, lr=self.stage1_lr, head_lr=self.head_lr,
+                    deadline=deadline, stage="stage1", world=world, rank=rank)
 
         if world > 1:
-            # rank 1 predicts half of every OOF fold; if it kept different
-            # weights the gathered probabilities would mix two models
-            dist_utils.broadcast_tensors([p.data for p in params])
+            dist_utils.broadcast_tensors(
+                [p.data for p in self.model.parameters() if p.requires_grad]
+                + [p.data for p in self.head.parameters()]
+            )
+        # every rank keeps its own snapshot: each one restarts stage 2 from it,
+        # and the weights are identical after the broadcast above
+        self._stage1_state = {
+            "lora": {k: v.detach().float().cpu().numpy()
+                     for k, v in self.model.named_parameters() if v.requires_grad},
+            "head": {k: v.detach().float().cpu().numpy()
+                     for k, v in self.head.state_dict().items()},
+        }
+        self._stage1_done = True
+        self._fit_count = 0
+        return self
 
+    def _restore_stage1(self) -> None:
+        if not self._stage1_state:
+            raise RuntimeError("two_stage fit called before fit_stage1")
+        torch = self.torch
+        with torch.no_grad():
+            own = dict(self.model.named_parameters())
+            for key, array in self._stage1_state["lora"].items():
+                if key in own:
+                    own[key].copy_(torch.from_numpy(array))
+            self.head.load_state_dict(
+                {k: torch.from_numpy(v) for k, v in self._stage1_state["head"].items()}
+            )
+
+    def _fit_qlora(self, texts: Sequence[str], y: Sequence[str],
+                   groups: Optional[Sequence[int]] = None) -> "QwenMember":
+        torch = self.torch or import_torch()
+        self.torch = torch
+        from .. import dist_utils
+
+        state = dist_utils.current()
+        world = state.world if self.distributed else 1
+        rank = state.rank if self.distributed else 0
+
+        if self.two_stage:
+            if not self._stage1_state:
+                raise RuntimeError(
+                    "two_stage member must run fit_stage1() on the pool first"
+                )
+            self._ensure_qlora()
+            if self._fit_count > 0:
+                # discard this fold's fine-tune and go back to the pool weights
+                self._restore_stage1()
+            epochs, lr, head_lr = self.stage2_epochs, self.stage2_lr, self.stage2_head_lr
+            stage = "stage2"
+        else:
+            # Every fold starts from a fresh adapter. Reusing the previous fold's
+            # weights would leak that fold's rows into this fold's OOF prediction.
+            if self._fit_count > 0 and self.reset_before_fit:
+                self.release(capture=False)
+                self.head = None
+                self._qlora_state = None
+                self._head_state = None
+            self._ensure_qlora()
+            epochs, lr, head_lr = self.epochs, self.lr, self.lr
+            stage = "qlora"
+
+        head = self.head
+        index = {label: i for i, label in enumerate(LABELS)}
+        y_all = np.asarray([index[v] for v in y], dtype=np.int64)
+        groups_arr = np.asarray(groups) if groups is not None else np.arange(len(texts))
+
+        deadline = (time.time() + self.time_budget_hours * 3600.0
+                    if self.time_budget_hours > 0 else None)
+        self._log(
+            f"{stage}: train={len(texts)} groups={len(np.unique(groups_arr))} "
+            f"world={world} triplets/rank={self.triplet_batch} "
+            f"epochs={epochs} lr={lr:g}/{head_lr:g}"
+        )
+        self._train(texts, y, groups_arr, epochs=epochs, lr=lr, head_lr=head_lr,
+                    deadline=deadline, stage=stage, world=world, rank=rank)
+
+        if world > 1:
+            dist_utils.broadcast_tensors(
+                [p.data for p in self.model.parameters() if p.requires_grad]
+                + [p.data for p in head.parameters()]
+            )
         self.model.eval()
         head.eval()
         self._fit_count += 1
-        self._log(f"qlora trained {step} optimizer steps ({micro} micro-batches) "
-                  f"in {time.time() - t0:.0f}s" + (" [rank0]" if world > 1 and rank == 0 else ""))
         return self
 
     def predict_proba(self, texts: Sequence[str],
                       groups: Optional[Sequence[int]] = None) -> np.ndarray:
         if self.mode == "probe" and self.head is None:
             raise RuntimeError("QwenMember.predict_proba called before fit")
-        if self.mode == "qlora" and (self.model is None or not self._peft_wrapped):
+        if self.mode != "probe" and (self.model is None or not self._peft_wrapped):
             self.load()
             self._ensure_qlora()
         texts = list(texts)
@@ -663,7 +815,7 @@ class QwenMember:
                     batch, padding=True, truncation=True,
                     max_length=self.max_len, return_tensors="pt",
                 ).to(self.device)
-                logits, _ = self._qlora_logits(enc)
+                logits, _, _ = self._qlora_logits(enc)
                 out.append(torch.softmax(logits, dim=1).float().cpu().numpy())
         return normalize_rows(np.vstack(out))
 
@@ -676,13 +828,13 @@ class QwenMember:
         self._pooled_hidden(list(texts))
 
     def save_adapter(self, path: str) -> None:
-        if self.mode == "qlora" and self.model is not None:
+        if self.mode != "probe" and self.model is not None:
             self.model.save_pretrained(path)
             self._log(f"adapter saved -> {path}")
 
     def _capture_state(self) -> None:
         """Snapshot the adapter + head as numpy so a later ``load`` restores it."""
-        if self.mode != "qlora" or self.model is None:
+        if self.mode == "probe" or self.model is None:
             return
         self._qlora_state = {
             k: v.detach().float().cpu().numpy()
@@ -725,7 +877,10 @@ class QwenMember:
         state["device"] = None
         # the per-text cache is regenerated on demand by ``load`` + ``predict``
         state["_cache"] = {}
-        if self.mode == "qlora":
+        # the stage-1 snapshot is only needed while fitting; it is ~100 MB and
+        # the final artifact must not carry it
+        state["_stage1_state"] = None
+        if self.mode != "probe":
             model = self.__dict__.get("model")
             if model is not None:
                 state["_qlora_state"] = {
@@ -751,5 +906,7 @@ class QwenMember:
         self._peft_wrapped = False
         self._lm_head = None
         self.__dict__.setdefault("_fit_count", 0)
+        self.__dict__.setdefault("_stage1_state", None)
+        self.__dict__.setdefault("_stage1_done", False)
         self.__dict__.setdefault("_qlora_state", None)
         self.__dict__.setdefault("_head_state", None)

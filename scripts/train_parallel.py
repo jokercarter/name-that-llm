@@ -140,6 +140,7 @@ def _stratified_fit_rows(df, limit: int, seed: int) -> np.ndarray:
 
 # -------------------------------------------------------------- stage: qwen
 def cmd_qwen(args) -> int:
+    from ntl_pact18.data import add_group_folds
     from ntl_pact18.device import detect_device
     from ntl_pact18.dist_utils import barrier, init_distributed, shutdown
     from ntl_pact18.labels import LABELS
@@ -154,6 +155,36 @@ def cmd_qwen(args) -> int:
     labels = df["model"].tolist()
     codes = encode_groups(df["prompt_id"].tolist())
 
+    two_stage = bool(cfg.get("features.qwen.two_stage", False))
+    if two_stage:
+        # Stage 1 sees the external pool only; stage 2 and every OOF fold see
+        # host rows only. Splitting them is the whole point: mixing the pool
+        # back into stage 2 is reported to make the result worse.
+        if "origin" not in df.columns:
+            print("[qwen] two_stage needs an 'origin' column "
+                  "(build the training file with scripts/build_external_mix.py)",
+                  file=sys.stderr)
+            return 2
+        host_mask = (df["origin"] == "competition").to_numpy()
+        # oversampled tail classes reuse a passage; stage 1 should see each
+        # passage once, otherwise a handful of classes get extra weight
+        pool_mask = (df["origin"] == "external").to_numpy()
+        host_df = df.loc[host_mask].reset_index(drop=True)
+        host_df = add_group_folds(host_df, int(df.attrs.get("n_folds", 5)),
+                                  int(cfg.get("project.seed", 42)))
+        host_idx = np.flatnonzero(host_mask)
+        fold_ids = host_df["fold"].to_numpy()
+        n_folds = int(host_df.attrs["n_folds"])
+        if rank == 0:
+            print(f"[qwen] two-stage: pool={int(pool_mask.sum())} rows / "
+                  f"{df.loc[pool_mask, 'prompt_id'].nunique()} prompts | "
+                  f"host={len(host_df)} rows / {host_df['prompt_id'].nunique()} prompts "
+                  f"| folds={n_folds}", flush=True)
+    else:
+        host_idx = np.arange(len(df))
+        fold_ids = df["fold"].to_numpy()
+        n_folds = int(df.attrs["n_folds"])
+
     device_info = detect_device(cfg, verbose=(rank == 0))
     qwen = build_qwen_member(cfg, device_info=device_info)
     if qwen is None:
@@ -162,10 +193,9 @@ def cmd_qwen(args) -> int:
     qwen.verbose = rank == 0
     if rank == 0:
         print(f"[qwen] rows={len(df)} prompts={df['prompt_id'].nunique()} "
-              f"classes={df['model'].nunique()} world={world}", flush=True)
+              f"classes={df['model'].nunique()} world={world} "
+              f"mode={qwen.mode} truncate={qwen.truncate_layers or 'off'}", flush=True)
 
-    n_folds = int(df.attrs["n_folds"])
-    fold_ids = df["fold"].to_numpy()
     cfg_budget = float(cfg.get("features.qwen.time_budget_hours", 0.0))
     hard_deadline = (time.time() + args.deadline_hours * 3600.0
                      if args.deadline_hours > 0 else None)
@@ -173,9 +203,20 @@ def cmd_qwen(args) -> int:
     timings = []
     t_start = time.time()
 
+    if two_stage:
+        pool_rows = np.flatnonzero(pool_mask)
+        t0 = time.time()
+        qwen.fit_stage1([texts[i] for i in pool_rows],
+                        [labels[i] for i in pool_rows],
+                        groups=codes[pool_rows])
+        timings.append(time.time() - t0)
+        _log_mem(rank, "stage1")
+
     for fold in range(n_folds):
-        tr = np.flatnonzero(fold_ids != fold)
-        va = np.flatnonzero(fold_ids == fold)
+        tr_local = np.flatnonzero(fold_ids != fold)
+        va_local = np.flatnonzero(fold_ids == fold)
+        tr = host_idx[tr_local]
+        va = host_idx[va_local]
         if rank == 0:
             print(f"[qwen] fold {fold + 1}/{n_folds}: train={len(tr)} val={len(va)}",
                   flush=True)
@@ -184,7 +225,7 @@ def cmd_qwen(args) -> int:
             # container's own shutdown; truncating a fit is far better than
             # having Kaggle kill the kernel at 9 h with no submission
             left = (hard_deadline - time.time() - args.reserve_hours * 3600.0) / 3600.0
-            qwen.time_budget_hours = max(0.25, min(cfg_budget, left))
+            qwen.time_budget_hours = max(0.05, min(cfg_budget, left))
             if rank == 0:
                 print(f"[qwen] wall-clock guard: {left:.2f} h left, "
                       f"fit budget {qwen.time_budget_hours:.2f} h", flush=True)
@@ -194,32 +235,42 @@ def cmd_qwen(args) -> int:
         oof[va] = probs
         timings.append(time.time() - t0)
         _log_mem(rank, f"fold{fold + 1}")
-        qwen.release()  # hand the card back before the next fold reloads
+        if not two_stage:
+            # hand the card back before the next fold reloads; two-stage keeps
+            # the trunk resident so each fold can restart from the stage-1
+            # snapshot instead of paying a 30 s reload
+            qwen.release()
 
     if rank == 0:
-        print("[qwen] refit on the full training file", flush=True)
+        print("[qwen] refit on the full host split", flush=True)
     t0 = time.time()
-    qwen.fit(texts, labels, groups=codes)
+    qwen.fit([texts[i] for i in host_idx], [labels[i] for i in host_idx],
+             groups=codes[host_idx])
     timings.append(time.time() - t0)
     _log_mem(rank, "refit")
 
     if rank == 0:
         Path(args.qwen_oof).parent.mkdir(parents=True, exist_ok=True)
         np.save(args.qwen_oof, oof)
+        qwen.release()   # capture the final adapter, drop the 4-bit weights
         joblib.dump(qwen, args.qwen_model)
         total = time.time() - t_start
-        print(f"[qwen] folds+refit in {total / 3600:.2f} h "
+        print(f"[qwen] total {total / 3600:.2f} h "
               f"({[round(t / 60, 1) for t in timings]} min)", flush=True)
         print(f"[qwen] oof -> {args.qwen_oof} | member -> {args.qwen_model}", flush=True)
         meta = {
             "rows": int(len(df)),
+            "host_rows": int(len(host_idx)),
             "folds": int(n_folds),
             "world": int(world),
+            "two_stage": bool(two_stage),
             "seconds_per_fit": [round(t, 1) for t in timings],
             "trainable_parameters": int(qwen.trainable_parameters()),
             "model_id": str(getattr(qwen, "model_id", "")),
             "max_len": int(getattr(qwen, "max_len", 0)),
             "lora_r": int(getattr(qwen, "lora_r", 0)),
+            "truncate_layers": int(getattr(qwen, "truncate_layers", 0)),
+            "pool_mode": str(getattr(qwen, "pool_mode", "")),
             "layers": list(getattr(qwen, "layers", [])),
         }
         (Path(args.qwen_oof).with_suffix(".json")).write_text(
