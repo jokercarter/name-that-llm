@@ -135,3 +135,32 @@ def test_stage1_class_weights_are_capped_and_normalised():
     assert np.all(w[3:] == 0.0)                     # absent classes get 0
     assert abs(np.mean(w[:3]) - 1.0) < 1e-5
     assert _member(stage1_class_weighted=False)._stage1_class_weights(y) is None
+
+
+def test_mode_two_stage_implies_the_flag_everywhere():
+    """Regression: the trainer and the member must derive the flag alike.
+
+    The shipped bug: the config set only ``mode: two_stage`` (no explicit
+    ``two_stage`` key), the member implied it from the mode, the parallel
+    trainer read the missing key as ``False`` -> stage 1 never ran and every
+    fold raised ``must run fit_stage1() on the pool first``.
+    """
+    from ntl_pact18.members import build_qwen_member, two_stage_from_config
+
+    cfg = load_config("configs/kaggle_2stage_8b.yaml", profile="off")
+    q = cfg.section("features.qwen")
+    assert "two_stage" not in q                 # the exact trap that shipped
+    assert str(q.get("mode")) == "two_stage"
+
+    # explicit override still wins
+    assert two_stage_from_config({"mode": "two_stage", "two_stage": False}) is False
+    assert two_stage_from_config({"mode": "probe", "two_stage": True}) is True
+    assert two_stage_from_config({"mode": "probe"}) is False
+    assert two_stage_from_config(None) is False
+
+    # what the trainer computes ...
+    trainer_flag = two_stage_from_config(q)
+    # ... must equal what the member constructor receives
+    member = build_qwen_member(cfg, types.SimpleNamespace(kind="cuda"))
+    assert member is not None
+    assert member.two_stage == trainer_flag is True

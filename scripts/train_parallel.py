@@ -155,7 +155,11 @@ def cmd_qwen(args) -> int:
     labels = df["model"].tolist()
     codes = encode_groups(df["prompt_id"].tolist())
 
-    two_stage = bool(cfg.get("features.qwen.two_stage", False))
+    # Same implication rule the member constructor uses (shared helper), so
+    # the trainer can never disagree with the member about the mode.
+    from ntl_pact18.members import two_stage_from_config
+
+    two_stage = two_stage_from_config(cfg.get("features.qwen", {}) or {})
     if two_stage:
         # Stage 1 sees the external pool only; stage 2 and every OOF fold see
         # host rows only. Splitting them is the whole point: mixing the pool

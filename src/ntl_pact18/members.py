@@ -132,6 +132,18 @@ def build_members(cfg, device_info=None) -> List[object]:
     return members
 
 
+def two_stage_from_config(qwen_cfg) -> bool:
+    """``mode: two_stage`` implies the two-stage trainer unless overridden.
+
+    Single source of truth for the member constructor and the parallel
+    trainer: if they ever disagree, the fold loop starts before
+    ``fit_stage1()`` has run and every fold raises. (That exact bug shipped
+    once - the trainer read the explicit key, the member read the mode.)
+    """
+    qwen_cfg = qwen_cfg or {}
+    return bool(qwen_cfg.get("two_stage", str(qwen_cfg.get("mode", "")) == "two_stage"))
+
+
 def build_qwen_member(cfg, device_info=None):
     """Instantiate the Qwen member from config, or ``None`` when disabled.
 
@@ -159,8 +171,8 @@ def build_qwen_member(cfg, device_info=None):
             device_info,
             mode=str(q.get("mode", "probe")),
             # ``mode: two_stage`` implies the two-stage trainer unless the
-            # explicit flag overrides it
-            two_stage=bool(q.get("two_stage", str(q.get("mode", "")) == "two_stage")),
+            # explicit flag overrides it (shared with the parallel trainer)
+            two_stage=two_stage_from_config(q),
             model_id=str(q.get("model_id", "Qwen/Qwen3-8B-Base")),
             max_len=int(q.get("max_len", 384)),
             batch_size=int(q.get("batch_size", 8)),
