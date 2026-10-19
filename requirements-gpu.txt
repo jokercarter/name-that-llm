@@ -1,0 +1,19 @@
+# GPU stack: the Qwen probe / QLoRA member plus the CUDA XGBoost backend.
+#
+#   pip install -r requirements-gpu.txt
+#
+# On a CUDA 12.x box install the matching torch build first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+#
+# On Kaggle the image already ships torch/transformers/peft; only bitsandbytes
+# is missing, so mount its wheel and install it offline:
+#   pip install --no-index --find-links /kaggle/input/<wheel-ds> bitsandbytes
+
+torch>=2.3
+transformers>=4.45
+peft>=0.13
+accelerate>=0.34
+bitsandbytes>=0.45
+
+# xgboost's pip wheel already contains the CUDA kernels (device="cuda")
+xgboost>=2.0

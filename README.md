@@ -20,8 +20,11 @@
 ```bash
 cd D:\research\projects\ntl-pact18
 
-# 1) 安装依赖（numpy/pandas/scipy/sklearn/pyyaml/joblib；lightgbm 可选）
+# 1) 核心依赖（numpy/pandas/scipy/sklearn/pyyaml/joblib/pyarrow）
 python -m pip install -r requirements.txt
+#    需要 Qwen 成员（probe / QLoRA）时再加 GPU 栈：
+#    python -m pip install -r requirements-gpu.txt
+#    Kaggle 镜像缺 bitsandbytes，离线安装方式见 docs/KAGGLE_RUNBOOK.md
 
 # 2) 端到端自检：生成合成数据 → 训练 → 预测 → 结构消融
 python run.py smoke

@@ -17,11 +17,19 @@ dependencies = [
     "scikit-learn>=1.2",
     "PyYAML>=6.0",
     "joblib>=1.2",
+    "pyarrow>=15",
 ]
 
 [project.optional-dependencies]
 boost = ["lightgbm>=4.0"]
-gpu = ["torch>=2.0"]
+gpu = [
+    "torch>=2.3",
+    "transformers>=4.45",
+    "peft>=0.13",
+    "accelerate>=0.34",
+    "bitsandbytes>=0.45",
+    "xgboost>=2.0",
+]
 dev = ["pytest>=7.0"]
 
 [project.scripts]

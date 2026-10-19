@@ -1,3 +1,5 @@
+# Core stack: enough to run every CPU member and the full PRISM pipeline.
+#   pip install -r requirements.txt
 numpy>=1.23
 pandas>=1.5
 scipy>=1.9
@@ -5,16 +7,21 @@ scikit-learn>=1.2
 PyYAML>=6.0
 joblib>=1.2
 
-# optional: better gradient boosting backend for the stylometry member.
-# The project degrades gracefully to sklearn HistGradientBoosting when absent.
-# lightgbm>=4.0
-
-# optional: GPU. Install a CUDA build instead of the default CPU wheel:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu126
-# xgboost's pip wheel already ships CUDA support (device='cuda').
-# xgboost>=2.0
-# torch>=2.0
+# parquet: external corpus input and the competition submission format
+pyarrow>=15
 
 # dev
 pytest>=7.0
-pyarrow>=15
+
+# ---------------------------------------------------------------------------
+# The GPU stack lives in requirements-gpu.txt so a CPU-only box does not pull
+# a 2 GB torch wheel:
+#   pip install -r requirements-gpu.txt
+#
+# Degradation when pieces are missing:
+#   no torch        -> the Qwen member and torch_linear are skipped
+#   no bitsandbytes -> QwenMember refuses to start (it no longer falls back to
+#                      fp16 + CPU offload, which silently turned a 5-member run
+#                      into a 4-member run)
+#   no xgboost      -> stylometry falls back to sklearn HistGradientBoosting
+# ---------------------------------------------------------------------------
