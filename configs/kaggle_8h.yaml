@@ -1,0 +1,95 @@
+# 8-hour QLoRA profile for Kaggle T4 x2 (single-GPU training).
+# Same members and post-processing as configs/real.yaml; only the Qwen member
+# is replaced by a LoRA-tuned 4-bit backbone with a layer-fusion head.
+#
+# Budget: 5 folds x 1.5 h = 7.5 h training + ~30 min evaluation/prediction.
+
+project:
+  seed: 42
+
+paths:
+  data_dir: /kaggle/input/name-that-llm
+  artifacts_dir: /kaggle/working/artifacts
+
+device:
+  preference: cuda
+  require_gpu: true
+
+data:
+  n_folds: 5
+
+features:
+  stylegram:
+    enabled: true
+    C: 0.5
+    center_mode: replace
+  stylometry:
+    enabled: true
+    backend: auto
+    n_estimators: 400
+    learning_rate: 0.04
+    max_leaf_nodes: 15
+  ngram_lm:
+    enabled: true
+    order: 2
+    alpha: 0.1
+  linear_baseline:
+    enabled: true
+    C: 2.0
+  torch_linear:
+    enabled: false
+
+  qwen:
+    enabled: true
+    mode: qlora
+    model_id: Qwen/Qwen3-8B-Base
+    max_len: 448
+    batch_size: 1
+    grad_accum: 8
+    # hidden_states indices: 0 = embeddings, 1..36 = decoder layers
+    layers: [3, 6, 12, 18, 24, 36]
+    lr: 0.0001
+    epochs: 1
+    lora_r: 32
+    lora_alpha: 64
+    lora_dropout: 0.05
+    grad_checkpoint: true
+    warmup_ratio: 0.03
+    weight_decay: 0.01
+    supcon_weight: 0.1
+    label_smoothing: 0.05
+    load_in_4bit: true
+    time_budget_hours: 1.30
+    log_every: 20
+
+calibration:
+  temperature: true
+  em_prior: false
+
+blend:
+  l2: 1.0
+  max_iter: 400
+
+clustering:
+  method: tfidf
+  threshold: 0.90
+  min_size: 2
+  max_size: 18
+
+prism:
+  enabled: true
+  mode: relaxed
+  lam: 2.0
+  min_size: 2
+  max_size: 18
+
+experts:
+  enabled: true
+  adaptive_rho: true
+  min_rows: 100
+
+shield:
+  enabled: true
+  penalty: 2.5
+  max_rate: 0.01
+  min_support: 100

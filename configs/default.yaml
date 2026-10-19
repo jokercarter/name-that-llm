@@ -1,0 +1,137 @@
+# PACT-18 default configuration.
+# Every key can be overridden by an environment variable:
+#   NTL_<SECTION>__<KEY>=value        e.g. NTL_PRISM__LAM=1.5
+#   NTL_<SECTION>_<KEY>=value         (single underscore also works)
+
+project:
+  name: ntl-pact18
+  seed: 42
+
+# ----------------------------------------------------------------------------
+# compute device policy: CUDA -> MPS -> CPU
+#   preference: auto  (try cuda, then mps, then cpu)
+#               cuda / mps  (force one, fall back to cpu with a loud reason)
+#               cpu         (never touch the accelerator)
+#   require_gpu: true  -> raise instead of silently falling back
+# ----------------------------------------------------------------------------
+device:
+  preference: auto
+  gpu_index: 0
+  require_gpu: false
+
+paths:
+  data_dir: data
+  artifacts_dir: artifacts
+
+data:
+  train_file: train.csv
+  test_file: test.csv
+  test_truth_file: test_truth.csv
+  n_folds: 5
+
+# ----------------------------------------------------------------------------
+# synthetic data (only used by `synth` / `smoke`; real runs read the CSV files)
+# ----------------------------------------------------------------------------
+synthetic:
+  n_train_prompts: 150
+  n_test_prompts: 60
+  test_missing_rate: 0.15     # share of (prompt, model) cells dropped in test
+  min_words: 40
+  max_words: 250
+
+features:
+  stylegram:
+    enabled: true
+    C: 0.5
+    center_mode: replace      # replace | add | off  (prompt-centered twin)
+    char:     { ngram: [3, 5], max_features: 120000, weight: 1.0 }
+    word:     { ngram: [1, 3], max_features: 90000,  weight: 0.7 }
+    shape:    { ngram: [2, 6], max_features: 30000,  weight: 0.5 }
+    function: { ngram: [1, 3], max_features: 25000,  weight: 0.5 }
+
+  stylometry:
+    enabled: true
+    backend: auto             # auto | lightgbm | hist
+    n_estimators: 300
+    learning_rate: 0.05
+    max_leaf_nodes: 15
+
+  ngram_lm:
+    enabled: true             # LLMDet-flavoured proxy-perplexity member
+    order: 2
+    alpha: 0.1
+
+  linear_baseline:
+    enabled: true
+    C: 2.0
+
+  # Qwen3-8B member (needs torch + transformers + bitsandbytes; CUDA only).
+  #   mode: probe -> frozen 4-bit backbone, pooled layer-18 states + LR head
+  #                 (keeps the prompt-grouped OOF protocol, ~0.25 s/doc)
+  #   mode: qlora -> 4-bit base + LoRA + linear head, one adapter per split
+  qwen:
+    enabled: auto
+    mode: probe
+    model_id: Qwen/Qwen3-8B-Base
+    max_len: 384
+    batch_size: 8
+    layers: [18]
+    C: 0.0025
+    epochs: 1
+    lr: 0.0001
+    lora_r: 16
+    lora_alpha: 32
+    load_in_4bit: true
+
+  # GPU-accelerated member (CUDA / MPS). 'auto' enables it only when an
+  # accelerator is actually usable, so CPU-only machines keep the CPU stack.
+  torch_linear:
+    enabled: auto
+    epochs: 400
+    lr: 0.1
+    weight_decay: 0.0001
+    char_max_features: 24000
+    word_max_features: 16000
+    shape_max_features: 7000
+    function_max_features: 5000
+
+calibration:
+  temperature: true
+  sinkhorn_alpha: 0.25
+  # SLD-EM prior correction. Off by default: it only pays off when the test
+  # class mix is genuinely shifted away from the training prior. Enable it
+  # (and re-check with `simulate`) if public/private leaderboards differ a lot.
+  em_prior: false
+  em_iters: 50
+
+blend:
+  l2: 1.0
+  max_iter: 300
+
+clustering:
+  method: learned             # learned | tfidf
+  threshold: 0.90
+  min_size: 2
+  max_size: 18
+
+prism:
+  enabled: true
+  mode: relaxed               # relaxed | hard
+  lam: 1.0                    # duplicate-slot penalty in nats
+  min_size: 2
+  max_size: 18
+  confidence_threshold: 0.0   # 0 disables the gate
+
+experts:
+  enabled: true
+  adaptive_rho: true
+  min_rows: 60
+
+shield:
+  enabled: true
+  penalty: 2.5
+  max_rate: 0.01
+  min_support: 40
+
+evaluation:
+  bootstrap: 1000

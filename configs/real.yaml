@@ -1,0 +1,93 @@
+# Real-data configuration: 18-way authorship attribution on the competition
+# train.csv (2,699 passages / 150 prompts / 18 models).
+#
+# Workflow:
+#   python run.py --config real.yaml split --source train.csv
+#   python run.py --config real.yaml train
+#   python run.py --config real.yaml predict --test-file data/real/val.csv \
+#          --truth-file data/real/val_truth.csv --out artifacts/real/val_pred.csv
+#   python run.py --config real.yaml train --train-file data/real/trainval.csv \
+#          --model-out artifacts/real/model_final.joblib
+#   python run.py --config real.yaml predict --model artifacts/real/model_final.joblib \
+#          --test-file data/real/test.csv --truth-file data/real/test_truth.csv \
+#          --out artifacts/real/test_pred.csv
+
+paths:
+  data_dir: data/real
+  artifacts_dir: artifacts/real
+
+device:
+  preference: auto      # cuda -> mps -> cpu
+  gpu_index: 0
+  require_gpu: false    # set true to fail instead of falling back to CPU
+
+data:
+  train_file: train.csv
+  test_file: test.csv
+  test_truth_file: test_truth.csv
+  n_folds: 5
+
+features:
+  stylegram:
+    C: 0.5
+    center_mode: replace
+    char:     { ngram: [3, 5], max_features: 120000, weight: 1.0 }
+    word:     { ngram: [1, 3], max_features: 90000,  weight: 0.7 }
+    shape:    { ngram: [2, 6], max_features: 30000,  weight: 0.5 }
+    function: { ngram: [1, 3], max_features: 25000,  weight: 0.5 }
+  stylometry:
+    backend: auto
+    n_estimators: 400
+    learning_rate: 0.04
+    max_leaf_nodes: 15
+  ngram_lm:
+    order: 2
+    alpha: 0.1
+  linear_baseline:
+    C: 2.0
+  torch_linear:
+    # GPU member. Measured on this corpus: it takes ~24% of the blend weight
+    # but costs ~0.003 balanced accuracy on the held-out test split, so it is
+    # off by default. Flip to 'auto' to include it (training stays 2-3x faster
+    # than the CPU-only stack either way, thanks to the xgboost-gpu backend).
+    enabled: false
+
+calibration:
+  temperature: true
+  em_prior: false      # only pays off under a genuine prior shift
+  em_iters: 50
+
+blend:
+  l2: 1.0
+  max_iter: 400
+
+clustering:
+  # On the real corpus the median-normalised TF-IDF clusterer generalises to
+  # unseen prompts better than the lightweight learned diagonal metric
+  # (val pair-F1 0.94 vs 0.47), so it is the default here.
+  method: tfidf
+  threshold: 0.90      # auto-calibrated on held-out prompt folds
+  min_size: 2
+  max_size: 18
+
+prism:
+  enabled: true
+  mode: relaxed
+  lam: 1.0
+  min_size: 2
+  max_size: 18
+  confidence_threshold: 0.0
+
+experts:
+  enabled: true
+  adaptive_rho: true
+  min_rows: 100
+
+shield:
+  enabled: true
+  penalty: 2.5
+  max_rate: 0.01
+  min_support: 100
+
+evaluation:
+  bootstrap: 2000

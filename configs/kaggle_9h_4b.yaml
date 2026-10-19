@@ -1,0 +1,108 @@
+# 9-hour profile: same architecture, smaller backbone, more data.
+#
+# Why this shape: QLoRA wall-clock is sample-pass bound, not parameter bound.
+# Going 8B -> 4B halves FLOPs per token (~2x throughput), which buys enough
+# budget to feed ~3x more external rows in the same 9 hours. Cutting LoRA rank
+# alone would save <5% time and only cost accuracy.
+#
+# Budget: 3 folds + 1 refit = 4 fits.
+#   ~11.4k samples/fit x 4 x 0.55 s = 7.0 h  (T4, 384 tok, conservative)
+#
+# Data: python scripts/build_external_mix.py --quota 800 \
+#           --external data/external/ntl_merged_external_large.parquet \
+#           --out data/real/trainval_plus_ext_800.csv
+
+project:
+  seed: 42
+
+paths:
+  data_dir: /kaggle/input/name-that-llm
+  artifacts_dir: /kaggle/working/artifacts
+
+device:
+  preference: cuda
+  require_gpu: true
+
+data:
+  n_folds: 3
+
+features:
+  stylegram:
+    enabled: true
+    C: 0.5
+    center_mode: replace
+  stylometry:
+    enabled: true
+    backend: auto
+    n_estimators: 400
+    learning_rate: 0.04
+    max_leaf_nodes: 15
+  ngram_lm:
+    enabled: true
+    order: 2
+    alpha: 0.1
+  linear_baseline:
+    enabled: true
+    C: 2.0
+  torch_linear:
+    enabled: false
+
+  qwen:
+    enabled: true
+    mode: qlora
+    # Kaggle model source: yngbogdnn27/qwen3-4b-instruct-2507
+    # (4B instruct; the head is retrained, so instruct vs base is acceptable)
+    model_id: yngbogdnn27/qwen3-4b-instruct-2507
+    max_len: 384
+    batch_size: 2
+    grad_accum: 4
+    layers: [3, 8, 16, 24]        # 4B also has 36 layers; 4 depths is enough
+    lr: 0.00005
+    epochs: 1
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.10
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    grad_checkpoint: true
+    warmup_ratio: 0.03
+    weight_decay: 0.05
+    supcon_weight: 0.05
+    label_smoothing: 0.10
+    load_in_4bit: true
+    time_budget_hours: 2.10       # 4 fits x 2.1 h = 8.4 h hard cap
+    val_fraction: 0.15
+    early_stop_patience: 2
+    eval_every: 100
+    log_every: 20
+
+calibration:
+  temperature: true
+  em_prior: false
+
+blend:
+  l2: 1.0
+  max_iter: 400
+
+clustering:
+  method: tfidf
+  threshold: 0.90
+  min_size: 2
+  max_size: 18
+
+prism:
+  enabled: true
+  mode: relaxed
+  lam: 2.0
+  min_size: 2
+  max_size: 18
+
+experts:
+  enabled: true
+  adaptive_rho: true
+  min_rows: 100
+
+shield:
+  enabled: true
+  penalty: 2.5
+  max_rate: 0.01
+  min_support: 100

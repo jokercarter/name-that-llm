@@ -1,0 +1,130 @@
+# 9-hour profile for the "use all ~50k rows" plan, trained on 2x T4.
+#
+# Relationship to the earlier plans
+# ---------------------------------
+#   plan D  (docs/SCALING_8H.md): 0.6B backbone, 50k rows, 1 GPU  -> 5.0-6.7 h
+#   plan D+ (this file):          1.7B backbone, 50k rows, 2 GPU  -> ~4-6 h
+#
+# The second card buys 2x throughput at the same per-card memory, so the
+# parameter budget goes up instead of the row count going down: 0.6B -> 1.7B
+# (2.8x FLOPs) is paid for by data parallelism (2x), leaving ~1.4x of plan D's
+# wall-clock. Trainable parameters grow from ~9 M to ~52 M because the adapter
+# is also widened (r16 q/k/v/o -> r32 on all seven projections, 6-layer head
+# 512-wide -> 8-layer head 768-wide).
+#
+# Budget: 3 folds (2/3 of rows each) + 1 refit = 150k sample passes.
+#   per card: 75k x 0.18 s = 3.8 h, + eval/load overhead ~0.6 h  -> ~4.4 h
+#   hard cap: 4 fits x 1.90 h = 7.6 h  (time_budget_hours below)
+#
+# Build the training file first:
+#   python scripts/build_external_mix.py --target-total 50000 \
+#       --external data/external/ntl_merged_external_large.parquet \
+#       --out data/real/trainval_plus_ext_50k.csv
+
+project:
+  seed: 42
+
+paths:
+  data_dir: /kaggle/input/name-that-llm
+  artifacts_dir: /kaggle/working/artifacts
+
+device:
+  preference: cuda
+  require_gpu: true
+
+# two worker processes, one T4 each; see scripts/train_parallel.py
+parallel:
+  gpus: 2
+  master_port: 29511
+
+data:
+  n_folds: 3
+
+features:
+  stylegram:
+    enabled: true
+    C: 0.5
+    center_mode: replace
+  stylometry:
+    enabled: true
+    backend: auto
+    n_estimators: 400
+    learning_rate: 0.04
+    max_leaf_nodes: 15
+  ngram_lm:
+    enabled: true
+    order: 2
+    alpha: 0.1
+  linear_baseline:
+    enabled: true
+    C: 2.0
+  torch_linear:
+    enabled: false        # 24% of the blend weight for a weaker member
+
+  qwen:
+    enabled: true
+    mode: qlora
+    # Overridden at launch with --model-path (a mounted Kaggle Models dir).
+    # Qwen3-1.7B: 28 layers, hidden 2048, tied embeddings.
+    model_id: Qwen/Qwen3-1.7B
+    max_len: 384
+    batch_size: 8         # per card; global batch = 8 x 2 cards x accum 2 = 32
+    grad_accum: 2
+    layers: [2, 5, 8, 12, 16, 20, 24, 28]
+    head_proj: 768
+    head_dropout: 0.10
+    lr: 0.0001
+    epochs: 1
+    lora_r: 32
+    lora_alpha: 64
+    lora_dropout: 0.10
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    grad_checkpoint: true
+    warmup_ratio: 0.03
+    weight_decay: 0.05
+    supcon_weight: 0.05
+    label_smoothing: 0.10
+    load_in_4bit: true
+    compute_dtype: auto    # fp16 on T4 (no bf16 units), bf16 on Ada
+    skip_lm_head: true     # the 151936-way projection is never used
+    length_bucket: true
+    bucket_pool: 40
+    distributed: true
+    reset_before_fit: true
+    time_budget_hours: 1.90
+    val_fraction: 0.15
+    early_stop_patience: 2
+    eval_every: 150
+    log_every: 20
+
+calibration:
+  temperature: true
+  em_prior: false          # class priors are unequal; the correction costs ~0.02
+
+blend:
+  l2: 1.0
+  max_iter: 400
+
+clustering:
+  method: tfidf
+  threshold: 0.90
+  min_size: 2
+  max_size: 18
+
+prism:
+  enabled: true
+  mode: relaxed
+  lam: 2.0
+  min_size: 2
+  max_size: 18
+
+experts:
+  enabled: true
+  adaptive_rho: true
+  min_rows: 100
+
+shield:
+  enabled: true
+  penalty: 2.5
+  max_rate: 0.01
+  min_support: 100

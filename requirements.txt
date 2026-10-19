@@ -1,0 +1,20 @@
+numpy>=1.23
+pandas>=1.5
+scipy>=1.9
+scikit-learn>=1.2
+PyYAML>=6.0
+joblib>=1.2
+
+# optional: better gradient boosting backend for the stylometry member.
+# The project degrades gracefully to sklearn HistGradientBoosting when absent.
+# lightgbm>=4.0
+
+# optional: GPU. Install a CUDA build instead of the default CPU wheel:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+# xgboost's pip wheel already ships CUDA support (device='cuda').
+# xgboost>=2.0
+# torch>=2.0
+
+# dev
+pytest>=7.0
+pyarrow>=15

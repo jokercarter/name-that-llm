@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+data/
+artifacts/
+*.joblib
+*.log
+submission*.csv
+submission*.parquet
+
+# local scratch: kernels, uploads, downloaded wheels, agent memory
+.tmp/
+.workbuddy/
+*.ipynb_checkpoints/
+
+# competition scaffold + packaging artifacts (regenerable)
+sample_submission.parquet
+ntl-pact18-code.zip
+
+# competition data: fetch it from the competition page, do not redistribute
+train.csv

@@ -1,0 +1,27 @@
+# Fast end-to-end configuration used by `python run.py smoke`.
+# Keeps the full pipeline (all members + calibration + clustering + PRISM +
+# experts + shield + EM) but shrinks the synthetic corpus and the feature space
+# so the whole thing finishes in well under two minutes on a laptop CPU.
+
+project:
+  seed: 7
+
+data:
+  n_folds: 4
+
+synthetic:
+  n_train_prompts: 60
+  n_test_prompts: 24
+  test_missing_rate: 0.15
+
+features:
+  stylegram:
+    char:     { ngram: [3, 5], max_features: 20000, weight: 1.0 }
+    word:     { ngram: [1, 2], max_features: 15000, weight: 0.7 }
+    shape:    { ngram: [2, 5], max_features: 8000,  weight: 0.5 }
+    function: { ngram: [1, 2], max_features: 6000,  weight: 0.5 }
+  stylometry:
+    n_estimators: 120
+
+evaluation:
+  bootstrap: 300

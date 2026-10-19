@@ -1,0 +1,113 @@
+# 8-hour QLoRA profile, regularised variant.
+#
+# Same budget and data mix as kaggle_8h.yaml, but the adapter is deliberately
+# smaller and the objective is softer. Use this when the OOF curve shows the
+# 108 M-parameter recipe memorising prompts instead of styles:
+#
+#   train BA 0.90+ while OOF BA stalls below the probe (0.42)
+#
+# Changes vs kaggle_8h.yaml:
+#   lora_r            32 -> 16          (94.4M -> 18.9M trainable in the adapter)
+#   target_modules    all 7 -> q/k/v/o  (drop the MLP adapters, the noisiest part)
+#   lora_dropout      0.05 -> 0.10
+#   label_smoothing   0.05 -> 0.10
+#   supcon_weight     0.10 -> 0.05
+#   lr                1e-4 -> 5e-5
+#   weight_decay      0.01 -> 0.05
+#   val_fraction      0 -> 0.15         (prompt-grouped inner split for early stop)
+#
+# Expected cost: unchanged wall-clock (forward passes dominate), slightly more
+# eval overhead (~4 min per fit at 192 rows every 100 steps).
+
+project:
+  seed: 42
+
+paths:
+  data_dir: /kaggle/input/name-that-llm
+  artifacts_dir: /kaggle/working/artifacts
+
+device:
+  preference: cuda
+  require_gpu: true
+
+data:
+  n_folds: 5
+
+features:
+  stylegram:
+    enabled: true
+    C: 0.5
+    center_mode: replace
+  stylometry:
+    enabled: true
+    backend: auto
+    n_estimators: 400
+    learning_rate: 0.04
+    max_leaf_nodes: 15
+  ngram_lm:
+    enabled: true
+    order: 2
+    alpha: 0.1
+  linear_baseline:
+    enabled: true
+    C: 2.0
+  torch_linear:
+    enabled: false
+
+  qwen:
+    enabled: true
+    mode: qlora
+    model_id: Qwen/Qwen3-8B-Base
+    max_len: 448
+    batch_size: 1
+    grad_accum: 8
+    layers: [3, 6, 12, 18, 24, 36]
+    lr: 0.00005
+    epochs: 1
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.10
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    grad_checkpoint: true
+    warmup_ratio: 0.05
+    weight_decay: 0.05
+    supcon_weight: 0.05
+    label_smoothing: 0.10
+    load_in_4bit: true
+    time_budget_hours: 1.30
+    val_fraction: 0.15
+    early_stop_patience: 2
+    eval_every: 100
+    log_every: 20
+
+calibration:
+  temperature: true
+  em_prior: false
+
+blend:
+  l2: 1.0
+  max_iter: 400
+
+clustering:
+  method: tfidf
+  threshold: 0.90
+  min_size: 2
+  max_size: 18
+
+prism:
+  enabled: true
+  mode: relaxed
+  lam: 2.0
+  min_size: 2
+  max_size: 18
+
+experts:
+  enabled: true
+  adaptive_rho: true
+  min_rows: 100
+
+shield:
+  enabled: true
+  penalty: 2.5
+  max_rate: 0.01
+  min_support: 100
