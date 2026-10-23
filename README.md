@@ -1,5 +1,20 @@
 # ntl-pact18
 
+> ## 当前主提交方案（2026-10-23 起）
+>
+> 主提交已切换为公开方案 **NTL Part Two Complement（Public 0.636）** 的原样复现，
+> 代码与输入清单见 [`vendor/top1_fleongg/`](vendor/top1_fleongg/README.md)：
+>
+> ```
+> 主集成 SVC 1.0 / Qwen3-14B 0.4 / Qwen2.5-14B 0.2 / DeBERTa 0.25
+> + 15% 互补栈（12 个公开成员）+ 10% ATLAS（仅不确定行）
+> → Sinkhorn 均衡
+> ```
+>
+> 运行环境 GPU T4 ×2、约 29 GB 输入、60–90 分钟。
+> 本文档以下的 PACT-18 流水线保留为 fallback 与研究记录，**不再作为默认提交路径**；
+> 其中 PRISM 簇内指派已被公开实测证伪（同代码加 Hungarian 后 public 0.558 vs local 0.723）。
+
 **PACT-18** — *Prompt-Aware Constrained aTtribution*：面向「Name That LLM」这类 **18 类 LLM 文本作者归属**任务的完整实现。
 
 给定一段 40–250 词的英文段落，判断它由 18 个前沿模型中的哪一个生成。项目的核心主张是：**除了把每段文本独立分类，还要利用数据的生成结构**——同一 prompt 下每个模型至多出现一次，因此在推断出的 prompt 簇内可以做带容量约束的联合解码（PRISM）。
@@ -10,8 +25,8 @@
 ```
 
 - 目标指标：balanced accuracy（每类召回的平均）
-- 公开参照：Code 区最强 notebook 0.559，Leaderboard 第一 0.622
-- 本项目定位：在公开融合栈之上，用结构约束与更好的聚类把上限推高
+- 公开参照（2026-10-23）：公开代码最高 **0.636**，Leaderboard 第一 **0.700**，前 20 名门槛 0.639
+- 本项目定位：主提交用公开最强融合栈复现；PACT-18 作为研究线与 fallback
 
 ---
 
